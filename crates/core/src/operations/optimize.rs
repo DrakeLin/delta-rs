@@ -1106,7 +1106,7 @@ pub(super) mod zorder {
     use super::*;
 
     use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
-    use arrow_array::{Array, ArrayRef, BinaryArray};
+    use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray};
     use arrow_buffer::bit_util::{get_bit_raw, set_bit_raw, unset_bit_raw};
     use arrow_row::{Row, RowConverter, SortField};
     use arrow_schema::ArrowError;
@@ -1171,7 +1171,7 @@ pub(super) mod zorder {
             }
 
             fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
-                Ok(DataType::Binary)
+                Ok(DataType::LargeBinary)
             }
 
             fn invoke_with_args(
@@ -1464,10 +1464,10 @@ pub(super) mod zorder {
         }
 
         let offsets = (0..=out_length)
-            .map(|i| (i * value_size) as i32)
-            .collect::<Vec<i32>>();
+            .map(|i| (i * value_size) as i64)
+            .collect::<Vec<i64>>();
 
-        let out_arr = BinaryArray::try_new(
+        let out_arr = LargeBinaryArray::try_new(
             OffsetBuffer::new(ScalarBuffer::from(offsets)),
             Buffer::from_vec(out),
             None,
