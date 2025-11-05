@@ -1129,8 +1129,9 @@ pub(super) mod zorder {
     use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
     use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray};
     use arrow_buffer::bit_util::{get_bit_raw, set_bit_raw, unset_bit_raw};
+    use arrow_cast::cast;
     use arrow_row::{Row, RowConverter, SortField};
-    use arrow_schema::ArrowError;
+    use arrow_schema::{ArrowError, DataType};
     // use arrow_schema::Schema as ArrowSchema;
 
     pub use self::datafusion::ZOrderExecContext;
@@ -1511,7 +1512,15 @@ pub(super) mod zorder {
         num_columns: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), ArrowError> {
-        // Convert array to rows
+        // Cast Utf8/Binary to LargeUtf8/LargeBinary to prevent i32 overflow
+        // This is critical when processing large string columns that may exceed 2GB
+        let input = match input.data_type() {
+            DataType::Utf8 => cast(&input, &DataType::LargeUtf8)?,
+            DataType::Binary => cast(&input, &DataType::LargeBinary)?,
+            _ => input,
+        };
+
+        // Convert array to rows (now with i64 offsets for large types)
         let converter = RowConverter::new(vec![SortField::new(input.data_type().clone())])?;
         let rows = converter.convert_columns(&[input])?;
 
