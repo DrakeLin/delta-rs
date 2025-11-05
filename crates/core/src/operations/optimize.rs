@@ -612,6 +612,7 @@ impl MergePlan {
         // Cast Utf8 columns to LargeUtf8 to prevent i32 overflow during sorting
         // This is necessary when sorting large string columns that may exceed 2GB
         let schema = df.schema();
+        let mut casts_needed = Vec::new();
         let cast_exprs: Vec<Expr> = schema
             .iter()
             .map(|(qualifier, field)| {
@@ -620,12 +621,25 @@ impl MergePlan {
                     None => Expr::Column(Column::new_unqualified(field.name())),
                 };
                 match field.data_type() {
-                    DataType::Utf8 => cast(col_expr, DataType::LargeUtf8).alias(field.name()),
-                    DataType::Binary => cast(col_expr, DataType::LargeBinary).alias(field.name()),
+                    DataType::Utf8 => {
+                        casts_needed.push(format!("{}: Utf8 -> LargeUtf8", field.name()));
+                        cast(col_expr, DataType::LargeUtf8).alias(field.name())
+                    }
+                    DataType::Binary => {
+                        casts_needed.push(format!("{}: Binary -> LargeBinary", field.name()));
+                        cast(col_expr, DataType::LargeBinary).alias(field.name())
+                    }
                     _ => col_expr.alias(field.name()),
                 }
             })
             .collect();
+
+        if !casts_needed.is_empty() {
+            info!(
+                "🔧 ZOrder Fix: DataFrame-level casts: {}",
+                casts_needed.join(", ")
+            );
+        }
 
         let df = df.select(cast_exprs)?;
 
@@ -1489,6 +1503,15 @@ pub(super) mod zorder {
             .map(|i| (i * value_size) as i64)
             .collect::<Vec<i64>>();
 
+        let max_offset = offsets.last().copied().unwrap_or(0);
+        info!(
+            "🔧 ZOrder Fix: Creating LargeBinaryArray with i64 offsets. Rows: {}, Columns: {}, Max offset: {} bytes ({:.2} GB)",
+            out_length,
+            columns.len(),
+            max_offset,
+            max_offset as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+
         let out_arr = LargeBinaryArray::try_new(
             OffsetBuffer::new(ScalarBuffer::from(offsets)),
             Buffer::from_vec(out),
@@ -1514,10 +1537,29 @@ pub(super) mod zorder {
     ) -> Result<(), ArrowError> {
         // Cast Utf8/Binary to LargeUtf8/LargeBinary to prevent i32 overflow
         // This is critical when processing large string columns that may exceed 2GB
+        let original_type = input.data_type().clone();
         let input = match input.data_type() {
-            DataType::Utf8 => cast(&input, &DataType::LargeUtf8)?,
-            DataType::Binary => cast(&input, &DataType::LargeBinary)?,
-            _ => input,
+            DataType::Utf8 => {
+                info!(
+                    "🔧 ZOrder Fix: Casting Utf8 -> LargeUtf8 for column at position {}",
+                    col_pos
+                );
+                cast(&input, &DataType::LargeUtf8)?
+            }
+            DataType::Binary => {
+                info!(
+                    "🔧 ZOrder Fix: Casting Binary -> LargeBinary for column at position {}",
+                    col_pos
+                );
+                cast(&input, &DataType::LargeBinary)?
+            }
+            _ => {
+                debug!(
+                    "ZOrder: Column at position {} already using type {:?}",
+                    col_pos, original_type
+                );
+                input
+            }
         };
 
         // Convert array to rows (now with i64 offsets for large types)
