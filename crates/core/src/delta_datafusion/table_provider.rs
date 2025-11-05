@@ -48,6 +48,7 @@ use futures::StreamExt as _;
 use itertools::Itertools;
 use object_store::ObjectMeta;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::delta_datafusion::schema_adapter::DeltaSchemaAdapterFactory;
 use crate::delta_datafusion::{
@@ -64,6 +65,35 @@ use crate::{ensure_table_uri, DeltaTable};
 use crate::{logstore::LogStoreRef, DeltaResult, DeltaTableError};
 
 const PATH_COLUMN: &str = "__delta_rs_path";
+
+/// Convert a schema to use LargeUtf8 and LargeBinary types instead of Utf8 and Binary.
+/// This prevents i32 overflow issues when reading large string/binary columns from Parquet.
+fn convert_schema_to_large_types(schema: &Schema) -> Schema {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let new_data_type = match field.data_type() {
+                DataType::Utf8 => DataType::LargeUtf8,
+                DataType::Binary => DataType::LargeBinary,
+                DataType::List(inner_field) => {
+                    // Recursively handle nested types
+                    let inner_schema = Schema::new(vec![inner_field.as_ref().clone()]);
+                    let converted = convert_schema_to_large_types(&inner_schema);
+                    DataType::List(Arc::new(converted.field(0).clone()))
+                }
+                dt => dt.clone(),
+            };
+
+            Arc::new(
+                Field::new(field.name(), new_data_type, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            )
+        })
+        .collect();
+
+    Schema::new(fields).with_metadata(schema.metadata().clone())
+}
 
 /// DataSink implementation for delta lake
 /// This uses DataSinkExec to handle the insert operation
@@ -591,14 +621,45 @@ impl<'a> DeltaScanBuilder<'a> {
                 .push(part);
         }
 
-        let file_schema = Arc::new(Schema::new(
+        let file_schema_base = Schema::new(
             schema
                 .fields()
                 .iter()
                 .filter(|f| !table_partition_cols.contains(f.name()))
                 .cloned()
                 .collect::<Vec<arrow::datatypes::FieldRef>>(),
-        ));
+        );
+
+        // Convert to large types to prevent i32 overflow when reading large strings/binaries
+        let file_schema_converted = convert_schema_to_large_types(&file_schema_base);
+
+        // Log which columns were converted
+        let converted_fields: Vec<String> = file_schema_base
+            .fields()
+            .iter()
+            .zip(file_schema_converted.fields().iter())
+            .filter_map(|(old, new)| {
+                if old.data_type() != new.data_type() {
+                    Some(format!(
+                        "{}: {:?} -> {:?}",
+                        old.name(),
+                        old.data_type(),
+                        new.data_type()
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !converted_fields.is_empty() {
+            info!(
+                "🔧 Parquet Read Fix: Converting schema to large types for: {}",
+                converted_fields.join(", ")
+            );
+        }
+
+        let file_schema = Arc::new(file_schema_converted);
 
         let mut table_partition_cols = table_partition_cols
             .iter()
