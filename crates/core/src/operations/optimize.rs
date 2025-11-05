@@ -601,12 +601,33 @@ impl MergePlan {
         context: Arc<zorder::ZOrderExecContext>,
         table_provider: DeltaTableProvider,
     ) -> Result<BoxStream<'static, Result<RecordBatch, ParquetError>>, DeltaTableError> {
+        use arrow_schema::DataType;
         use datafusion::common::Column;
         use datafusion::logical_expr::expr::ScalarFunction;
-        use datafusion::logical_expr::{Expr, ScalarUDF};
+        use datafusion::logical_expr::{cast, Expr, ScalarUDF};
 
         let provider = table_provider.with_files(files.files);
         let df = context.ctx.read_table(Arc::new(provider))?;
+
+        // Cast Utf8 columns to LargeUtf8 to prevent i32 overflow during sorting
+        // This is necessary when sorting large string columns that may exceed 2GB
+        let schema = df.schema();
+        let cast_exprs: Vec<Expr> = schema
+            .iter()
+            .map(|(qualifier, field)| {
+                let col_expr = match qualifier {
+                    Some(q) => Expr::Column(Column::new(Some(q.clone()), field.name())),
+                    None => Expr::Column(Column::new_unqualified(field.name())),
+                };
+                match field.data_type() {
+                    DataType::Utf8 => cast(col_expr, DataType::LargeUtf8).alias(field.name()),
+                    DataType::Binary => cast(col_expr, DataType::LargeBinary).alias(field.name()),
+                    _ => col_expr.alias(field.name()),
+                }
+            })
+            .collect();
+
+        let df = df.select(cast_exprs)?;
 
         let cols = context
             .columns
